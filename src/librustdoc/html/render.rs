@@ -32,12 +32,13 @@
 //! for creating the corresponding search index and source file renderings.
 //! These tasks are not parallelized (they haven't been a bottleneck yet), and
 //! both occur before the crate is rendered.
+
 pub use self::ExternalLocation::*;
 
 use std::cell::RefCell;
 use std::cmp::Ordering::{mod, Less, Greater, Equal};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BTreeMap};
 use std::default::Default;
 use std::fmt;
 use std::io::fs::PathExtensions;
@@ -46,10 +47,9 @@ use std::io;
 use std::iter::repeat;
 use std::str;
 use std::sync::Arc;
-
+use serialize::json::{mod, Json};
 use externalfiles::ExternalHtml;
 
-use serialize::json;
 use serialize::json::ToJson;
 use syntax::ast;
 use syntax::ast_util;
@@ -1049,6 +1049,244 @@ impl<'a> Cache {
     }
 }
 
+#[deriving(Clone, Encodable, Decodable, Show)]
+pub enum HType {
+    App(Box<HType>, Vec<Box<HType>>),
+    Lit(String),
+    Var(String),
+    Fun(Vec<Box<HType>>)
+}
+
+#[deriving(Clone, Encodable, Decodable)]
+pub struct HTypeSig {
+    // constraint: Vec<Box<HType>>,
+    ty: Box<HType>
+}
+
+trait ToHType {
+    fn to_htype(&self) -> Option<Box<HType>>;
+}
+
+impl ToHType for clean::FnDecl {
+    fn to_htype(&self) -> Option<Box<HType>> {
+        let args = self.inputs.to_htype();
+        let retty = self.output.to_htype();
+        println!("Args: {}, Retty: {}", args, retty);
+        match (retty, args) {
+            // fn(a, b) -> c ==> (a, b) -> c
+            (Some(retty), Some(args)) => Some(box HType::Fun(vec!(args, retty))),
+
+            // fn(a, b) ==> (a, b)            
+            (None, Some(args)) => Some(args),
+
+            // fn() -> c ==> c
+            (Some(retty), None) => Some(retty),
+
+            (None, None) => None
+        }
+    }
+}
+
+fn from_option<T>(v: Vec<Option<T>>) -> Option<Vec<T>> {
+    match v.iter().any(|el| el.is_none()) {
+        true => None,
+        false => Some(v.into_iter().map(|el| el.unwrap()).collect())
+    }
+}
+
+impl ToHType for clean::Arguments {
+    fn to_htype(&self) -> Option<Box<HType>> {
+        // TODO -> handle nulled case
+        let args = self.values.iter().map(|input| input.type_.to_htype()).collect::<Vec<_>>();
+        match from_option(args) {
+            None => None,
+            Some(args) => Some(box HType::App(box HType::Lit("(,)".to_string()), args))
+        }
+    }
+}
+
+fn method_htype(for_: &clean::Type, method: &clean::Method) -> Option<Box<HType>> {
+    let declty = method.decl.to_htype();
+    let selfty = match method.self_ {
+        clean::SelfTy::SelfStatic => None,
+        clean::SelfTy::SelfValue | clean::SelfTy::SelfBorrowed(..) => for_.to_htype(),
+        clean::SelfTy::SelfExplicit(ref ty) => ty.to_htype()
+    };
+    println!("Method htype: declty: {}, selfty: {}", declty, selfty);
+    match (declty, selfty) {
+        // If we don't have a declty, we can't really do much
+        (None, _)  => None,
+        
+        // RUST: fn(self, a, b) -> c ==> self -> (a, b) -> c
+        (Some(box HType::Fun(ref mut args)), Some(ref selfty)) => {
+            args.insert(0, selfty.clone());
+            Some(box HType::Fun(args.clone()))
+        }
+
+        // fn(a, b) -> c ==> (a, b) -> c
+        (Some(declty), None) => Some(declty),
+
+        _ => None,
+    }
+}
+
+impl ToHType for clean::Function {
+    fn to_htype(&self) -> Option<Box<HType>> {
+        self.decl.to_htype()
+    }
+}
+
+
+impl ToHType for clean::FunctionRetTy {
+    fn to_htype(&self) -> Option<Box<HType>> {
+        match *self {
+            clean::Return(clean::Tuple(ref tys)) if tys.is_empty() => None,
+            clean::Return(ref ty) => ty.to_htype(),
+            clean::NoReturn => None,
+        }
+    }
+}
+
+fn path_parameters_htype(p: &clean::PathParameters) -> Option<Vec<Box<HType>>> {
+    match *p {
+        clean::PathParameters::AngleBracketed { ref types, .. } => {
+            match types.len() {
+                0 => None,
+                _ => from_option(types.iter().map(|ty| ty.to_htype()).collect())
+            }
+        }
+        _ => None,
+    }
+}
+
+impl ToHType for clean::Type {
+    fn to_htype(&self) -> Option<Box<HType>> {
+        match *self {
+            clean::TyParamBinder(id) => {
+                let tyname = cache().typarams[ast_util::local_def(id)].to_string();
+                Some(box HType::Lit(tyname))
+            }
+            clean::Generic(ref name) => {
+                Some(box HType::Var(name.clone()))
+            }
+            clean::Primitive(prim) => { Some(box HType::Lit(prim.to_string().to_string())) }
+            clean::ResolvedPath{ did, ref path, .. } => {
+                let tyname = match cache().paths.get(&did) {
+                    None => { return None }
+                    Some(&(ref fqp, _)) => {
+                        box HType::Lit(fqp.last().unwrap().to_string())
+                    }
+                };
+                let last = path.segments.last().unwrap();
+                match path_parameters_htype(&last.params) {
+                    Some(typarams) => Some(box HType::App(tyname, typarams)),
+                    None => Some(tyname),
+                }
+            }
+            clean::BorrowedRef{ref type_, ..} => type_.to_htype(),
+            // clean::Tuple(tys) => 
+            _ => None
+        }
+    }
+}
+
+#[deriving(Encodable, Clone)]
+struct HoogleItem {
+    name: String,
+    signature: HTypeSig,
+}
+
+
+fn hoogle_functions(m: &clean::Module) -> Vec<HoogleItem> {
+    m.items.iter()
+        .filter_map(|i| match i.inner {
+            clean::FunctionItem(ref f) => {
+                match f.to_htype() {
+                    Some(htype) => Some(HoogleItem {
+                        name: i.name.clone().unwrap(),
+                        signature: HTypeSig { ty: htype}
+                    }),
+                    None => None
+                }
+            }
+            _ => None
+        })
+        .collect()
+}
+
+fn hoogle_methods(m: &clean::Module) -> Vec<HoogleItem> {
+    fn extract_method(for_: &clean::Type, meth: &clean::Method, name: String) -> Option<HoogleItem> {
+        println!("Trying to extract method for name: {}", name);
+        match method_htype(for_, meth) {
+            None => {
+                println!("No htype for name: {}", name);
+                None
+            }
+            Some(htype) => Some(HoogleItem {
+                // TODO: prefix with type name?
+                name: format!("{}", name),
+                signature: HTypeSig { ty: htype }
+            })
+        }
+    }
+
+    fn impl_flat_map(impl_: &clean::Impl) -> Vec<HoogleItem> {
+        impl_.items.iter().filter_map(|it| {
+            println!("Looking through impl for methods");
+            match it.inner {
+                clean::MethodItem(ref meth) => {
+                    println!("Found method in impl");
+                    let for_: &clean::Type = &impl_.for_;
+                    let name: String = it.name.clone().unwrap();
+                    extract_method(for_, meth, name)
+                }
+                _ => None
+            }
+        }).collect::<Vec<HoogleItem>>()
+    }
+
+    println!("Module with {} items", m.items.len());
+    m.items.iter()
+        .flat_map(|i: &clean::Item| {
+            println!("Got item: {}", i.name.clone());
+            let items = match i.inner {
+                clean::StructItem(..) => {
+                    println!("Found struct item: {}", i.name.clone());
+                    match cache().impls.get(&i.def_id) {
+                        Some(v) => {
+                            println!("Found impl");
+                            v.iter()
+                                .flat_map(|impl_| impl_flat_map(&impl_.impl_).into_iter()).collect()
+                        }
+                        _ => vec!()
+                    }
+                }
+                _ => vec!()
+            };
+            println!("Got {} methods for struct {}", items.len(), i.name.clone());
+            items.into_iter()
+        })
+        .collect::<Vec<HoogleItem>>()
+        .clone()
+}
+
+fn write_hoogle(m: &clean::Module, hoogle_dst: Path) -> io::IoResult<()> {
+    // println!("Crate JSON: {}", json::as_json(m));
+    let mut json = BTreeMap::new();
+    let mut functions = hoogle_functions(m);
+    let methods = hoogle_methods(m);
+    functions.extend(methods.into_iter());
+    let crate_json_str = format!("{}", json::as_json(&functions));
+    let crate_json = match json::from_str(crate_json_str.as_slice()) {
+        Ok(j) => j,
+        Err(e) => panic!("Rust generated JSON is invalid: {}", e)
+    };
+    json.insert("crate".to_string(), crate_json);
+    let mut file = try!(File::create(&hoogle_dst));
+    write!(&mut file, "{}", Json::Object(json))
+}
+
+
 impl Context {
     /// Recurse in the directory structure and change the "root path" to make
     /// sure it always points to the top (relatively)
@@ -1230,6 +1468,8 @@ impl Context {
                         clean::ModuleItem(m) => m,
                         _ => unreachable!()
                     };
+
+                    try!(write_hoogle(&m, this.dst.join("hoogle.json")));
                     this.sidebar = this.build_sidebar(&m);
                     for item in m.items.into_iter() {
                         f(this,item);
